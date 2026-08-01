@@ -1,0 +1,15 @@
+[package]
+name = "zkleak"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Measure exactly what a zkVM proof reveals about its private inputs, via cycle counts."
+repository = "https://github.com/JqnWu27/zkLeak"
+keywords = ["zkvm", "sp1", "risc0", "leakage", "privacy"]
+categories = ["command-line-utilities", "cryptography"]
+
+[[bin]]
+name = "zkleak"
+path = "src/main.rs"
+
+[dependencies]

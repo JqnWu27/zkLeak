@@ -1,0 +1,17 @@
+# Five credential issuers share one whitelist. The proof is supposed to hide
+# WHICH issuer signed your credential -- but the guest verifies using that
+# issuer's signature algorithm, so the cycle count reveals the ALGORITHM CLASS.
+#
+# The lesson: leakage counts CLASSES, not issuers. Three issuers using RSA-2048
+# collide into one indistinguishable group, so five issuers leak far less than
+# log2(5) bits. Adding an issuer that reuses an existing algorithm ENLARGES an
+# anonymity set; adding one with a new algorithm creates a new class.
+#
+# Issuers are fictional. Cycle magnitudes are representative SP1 costs for the
+# named algorithms; weights are illustrative holder populations.
+secret,cycles,weight
+IssuerA_RSA2048,17320000,20000000
+IssuerB_RSA2048,17320000,20000000
+IssuerC_RSA2048,17320000,5000000
+IssuerD_P256,11754000,8000000
+IssuerE_P384,47728000,1300000
