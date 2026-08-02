@@ -859,19 +859,25 @@ SCOPE
 /// The point is that a newcomer can see the whole tool work, and check it is
 /// telling the truth, without owning a zkVM or writing a sweep.
 fn cmd_demo() {
-    let dirs = ["examples", "zkleak/examples", "../examples"];
-    let base = dirs.iter().find(|d| {
-        std::path::Path::new(d).join("negative-control.csv").exists()
-    });
-    let base = match base {
-        Some(b) => *b,
-        None => {
-            eprintln!("zkleak demo: cannot find the examples/ directory.");
-            eprintln!("Run this from the zkleak checkout, or pass a CSV to `report` directly.");
-            process::exit(2);
+    // The sweeps are COMPILED IN rather than read from disk, so `demo` works
+    // from any directory -- including after `cargo install`, where there is no
+    // checkout to find. The help text promises the example data ships with the
+    // tool; this is what makes that true. ~29 KB total.
+    const NEGATIVE_CONTROL: &str = include_str!("../examples/negative-control.csv");
+    const LEAKY: &str = include_str!("../examples/leaky-hash-lengths.csv");
+    const SKEWED: &str = include_str!("../examples/skewed-prior.csv");
+
+    /// Parse an embedded sweep. A failure here is a build-time packaging error,
+    /// not user input, so it should be loud rather than graceful.
+    fn embedded(name: &str, text: &str) -> (Vec<(String, u64, f64)>, bool) {
+        match parse_csv(text) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("zkleak: bundled example {} is corrupt: {}", name, e);
+                process::exit(70); // EX_SOFTWARE
+            }
         }
-    };
-    let path = |f: &str| std::path::Path::new(base).join(f).to_string_lossy().into_owned();
+    }
 
     let rule = "=".repeat(76);
 
@@ -879,7 +885,7 @@ fn cmd_demo() {
     println!("1/4  NEGATIVE CONTROL -- trip count fixed, data varies.");
     println!("     A correct tool MUST print 0.0000 bits. Check this first.");
     println!("{}", rule);
-    let (rows, w) = load(&path("negative-control.csv"));
+    let (rows, w) = embedded("negative-control.csv", NEGATIVE_CONTROL);
     let (p, acc) = build_partition(&rows);
     print_leakage(&compute_leakage(&p, &acc), &p, !w);
 
@@ -887,7 +893,7 @@ fn cmd_demo() {
     println!("2/4  A GUEST THAT LEAKS -- buffer padded, but the loop still runs");
     println!("     over the TRUE length. Padding the buffer alone does nothing.");
     println!("{}", rule);
-    let (rows, w) = load(&path("leaky-hash-lengths.csv"));
+    let (rows, w) = embedded("leaky-hash-lengths.csv", LEAKY);
     let (p, acc) = build_partition(&rows);
     print_leakage(&compute_leakage(&p, &acc), &p, !w);
     println!("\n  Note `largest identical class = 64`: SHA-256 works in 64-byte");
@@ -897,14 +903,14 @@ fn cmd_demo() {
     println!("\n{}", rule);
     println!("3/4  WHAT WOULD A FIX COST? -- optimal padding, exactly solved");
     println!("{}", rule);
-    let (rows, _) = load(&path("leaky-hash-lengths.csv"));
+    let (rows, _) = embedded("leaky-hash-lengths.csv", LEAKY);
     cmd_buckets(&rows, 8);
 
     println!("\n{}", rule);
     println!("4/4  A REALISTIC PRIOR -- same guest, skewed length distribution");
     println!("     Uniform priors roughly DOUBLE the apparent leak here.");
     println!("{}", rule);
-    let (rows, w) = load(&path("skewed-prior.csv"));
+    let (rows, w) = embedded("skewed-prior.csv", SKEWED);
     let (p, acc) = build_partition(&rows);
     print_leakage(&compute_leakage(&p, &acc), &p, !w);
 
