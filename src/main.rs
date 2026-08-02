@@ -134,7 +134,7 @@ fn compute_leakage(p: &Partition, acc: &Acc) -> Leakage {
 
     let largest_class_weight = p.classes.values().cloned().fold(0.0f64, f64::max);
 
-    Leakage {
+    let out = Leakage {
         shannon_bits: (h_s - h_s_given_o).max(0.0),
         min_entropy_bits: min_entropy_bits.max(0.0),
         residual_bits: h_s_given_o.max(0.0),
@@ -142,10 +142,46 @@ fn compute_leakage(p: &Partition, acc: &Acc) -> Leakage {
         guess_probability,
         num_classes: p.classes.len(),
         largest_class_weight,
+    };
+
+    // SAFETY NET. For a measurement tool the worst failure is a number that is
+    // not a number, printed under a success exit code -- a reader has no way to
+    // tell it apart from a real result. Rescaling should make this unreachable;
+    // if some future path reaches it anyway, fail loudly instead of reporting
+    // NaN or inf as a finding.
+    for (name, v) in [
+        ("Shannon leakage", out.shannon_bits),
+        ("min-entropy leakage", out.min_entropy_bits),
+        ("residual entropy", out.residual_bits),
+        ("secret entropy", out.secret_bits),
+        ("guess probability", out.guess_probability),
+    ] {
+        if !v.is_finite() {
+            eprintln!("zkleak: internal error -- {} computed as {}, refusing to report it.", name, v);
+            eprintln!("This is a bug. Please report it with the input that triggered it.");
+            process::exit(70); // EX_SOFTWARE
+        }
     }
+
+    out
 }
 
 /// Build the partition + accumulators from (cycles, weight) samples.
+///
+/// NUMERICS: weights are rescaled by their maximum before any arithmetic.
+///
+/// Every quantity reported here is a function of the probabilities `w_i / W`,
+/// which are invariant under a common scale factor -- so this changes no result,
+/// but it removes two distinct overflow routes that both produced a non-finite
+/// answer with a success exit code:
+///
+///   * `w * log2(w)` overflows for w around 1.8e305, since the log factor is
+///     ~1000. That yielded `H(S) = -inf` well BELOW the sum-overflow threshold.
+///   * the running `total_weight` overflows once the sum passes f64::MAX,
+///     making every probability `w/inf = 0` or `inf/inf = NaN`.
+///
+/// After rescaling, every weight is in (0, 1], so `|w log2 w| <= 0.531` per row
+/// and the accumulators cannot overflow for any row count that fits in memory.
 fn build_partition(rows: &[(String, u64, f64)]) -> (Partition, Acc) {
     let mut classes: BTreeMap<u64, f64> = BTreeMap::new();
     let mut max_in_class: BTreeMap<u64, f64> = BTreeMap::new();
@@ -153,8 +189,11 @@ fn build_partition(rows: &[(String, u64, f64)]) -> (Partition, Acc) {
     let mut total_weight = 0.0f64;
     let mut max_secret_weight = 0.0f64;
 
+    let scale = rows.iter().map(|r| r.2).fold(0.0f64, f64::max);
+    let scale = if scale > 0.0 && scale.is_finite() { scale } else { 1.0 };
+
     for (_, cycles, weight) in rows {
-        let w = *weight;
+        let w = *weight / scale;
         *classes.entry(*cycles).or_insert(0.0) += w;
         let e = max_in_class.entry(*cycles).or_insert(0.0);
         if w > *e {
@@ -598,6 +637,57 @@ fn cmd_selftest() {
     // k=2 optimum: {0,1} -> 1 and {2,3} -> 3, overhead (1+0+1+0)/4 = 0.5
     check("bucket k=2 overhead", sols[1].0 / 4.0, 0.5, 1e-12, &mut failures);
 
+    // --- numeric hardening -------------------------------------------------
+    // Non-finite weights must be REJECTED at parse time, not carried into the
+    // arithmetic where they produce NaN under a success exit code.
+    for (label, text) in [
+        ("reject inf weight", "a,1,inf\nb,2,1\n"),
+        ("reject -inf weight", "a,1,-inf\nb,2,1\n"),
+        ("reject nan weight", "a,1,nan\nb,2,1\n"),
+        ("reject zero weight", "a,1,0\nb,2,1\n"),
+    ] {
+        let rejected = parse_csv(text).is_err();
+        check(label, if rejected { 1.0 } else { 0.0 }, 1.0, 0.0, &mut failures);
+    }
+
+    // Enormous but FINITE weights must still give the right answer. Two equal
+    // weights carry exactly 1 bit however large they are; before rescaling,
+    // w*log2(w) overflowed near 1.8e305 and this returned -inf.
+    for (label, w) in [
+        ("huge weight 1e305", "1e305"),
+        ("huge weight 1e307", "1e307"),
+        ("huge weight 1e308", "1e308"),
+    ] {
+        let text = format!("a,1,{w}\nb,2,{w}\n");
+        let (rows, _) = parse_csv(&text).expect("finite weights must parse");
+        let (p, acc) = build_partition(&rows);
+        let l = compute_leakage(&p, &acc);
+        check(label, l.secret_bits, 1.0, 1e-9, &mut failures);
+    }
+
+    // A 1e300:1 weight ratio must not underflow to NaN.
+    {
+        let (rows, _) = parse_csv("a,1,1e300\nb,2,1\n").unwrap();
+        let (p, acc) = build_partition(&rows);
+        let l = compute_leakage(&p, &acc);
+        let finite = l.secret_bits.is_finite()
+            && l.shannon_bits.is_finite()
+            && l.min_entropy_bits.is_finite();
+        check("extreme ratio finite", if finite { 1.0 } else { 0.0 }, 1.0, 0.0, &mut failures);
+    }
+
+    // Weight rescaling must not change any reported quantity.
+    {
+        let (r1, _) = parse_csv("a,1,3\nb,2,1\nc,2,1\n").unwrap();
+        let (r2, _) = parse_csv("a,1,3e200\nb,2,1e200\nc,2,1e200\n").unwrap();
+        let (p1, a1) = build_partition(&r1);
+        let (p2, a2) = build_partition(&r2);
+        let l1 = compute_leakage(&p1, &a1);
+        let l2 = compute_leakage(&p2, &a2);
+        check("scale invariance: Shannon", l2.shannon_bits, l1.shannon_bits, 1e-12, &mut failures);
+        check("scale invariance: min-ent", l2.min_entropy_bits, l1.min_entropy_bits, 1e-12, &mut failures);
+    }
+
     // Case 7 (regression): at k = #classes NO padding is applied, so `buckets`
     // must agree with `report` on the identical partition. The original code
     // collapsed each class into one pseudo-secret carrying the whole class
@@ -762,8 +852,15 @@ fn parse_csv(text: &str) -> Result<(Vec<(String, u64, f64)>, bool), String> {
         } else {
             1.0
         };
-        if !(weight > 0.0) {
-            return Err(format!("line {}: weight must be positive, got {}", idx + 1, weight));
+        // `!(w > 0.0)` alone rejects NaN, -inf, zero and negatives (all make the
+        // comparison false), but `inf > 0.0` is TRUE, so infinity sailed through
+        // and poisoned every downstream probability. Require finiteness too.
+        if !(weight > 0.0) || !weight.is_finite() {
+            return Err(format!(
+                "line {}: weight must be positive and finite, got {}",
+                idx + 1,
+                weight
+            ));
         }
         rows.push((f[0].to_string(), cycles, weight));
     }
