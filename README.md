@@ -133,15 +133,21 @@ Costs of independent items convolve, so leakage for *n* items follows from a
 single-item sweep:
 
 ```
-  n         min-entropy  total Shannon per-item Shannon
+  n         min-entropy  total Shannon   marginal (nth)
   1              4.0875         4.0366           4.0366
   8              7.0112         5.7551           0.0966
   64            10.0014         7.2559           0.0114
 ```
 
-Total leakage grows about half a bit per doubling; what leaks about any *one*
-item falls off as roughly 1/n. Assumes items are i.i.d. and only the **sum** is
-observable — an observer who sees per-item costs gains nothing from batching.
+Total leakage grows about half a bit per doubling of the batch **as a whole**.
+
+The last column is the *marginal* contribution of the n-th item,
+`H(O_n) − H(O_n−1)`. It shrinks as roughly 1/n, which suggests — but is **not
+equal to** — `I(L_i;O)`, the leakage about one specific item. Treat it as an
+indicator, not that quantity.
+
+Assumes items are i.i.d. and only the **sum** is observable — an observer who
+sees per-item costs gains nothing from batching.
 
 ## Input format
 

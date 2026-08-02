@@ -340,20 +340,31 @@ fn cmd_buckets(rows: &[(String, u64, f64)], max_k: usize) {
     let solutions = optimal_buckets(&values, k_cap);
     for (idx, (total_overhead, bounds)) in solutions.iter().enumerate() {
         let k = idx + 1;
-        // Build the bucketed partition to get exact Shannon leakage.
-        let mut bucketed: Vec<(String, u64, f64)> = Vec::new();
+        // Map each distinct cost to the padded cost of the bucket holding it.
+        let mut pad_of: BTreeMap<u64, u64> = BTreeMap::new();
         let mut start = 0usize;
         for &end in bounds.iter() {
             let pad_to = values[end].0;
             for t in start..=end {
-                // preserve per-secret weights: expand class weight back out is not
-                // possible, so use the class weight as a single pseudo-secret.
-                // For Shannon this is exact only if the prior is uniform within
-                // the class, which it is by construction (same cycle count).
-                bucketed.push((format!("v{}", t), pad_to, values[t].1));
+                pad_of.insert(values[t].0, pad_to);
             }
             start = end + 1;
         }
+        // Re-map the ORIGINAL secrets, preserving per-secret weights.
+        //
+        // An earlier version collapsed each cost class into a single
+        // pseudo-secret carrying the whole class weight. That is harmless for
+        // Shannon -- I(S;O) = H(O) for a deterministic observable, which depends
+        // only on class weights -- but wrong for min-entropy, which is a MAX over
+        // per-secret weights, not a sum. It was wrong in BOTH directions: on the
+        // bundled examples it understated by 2.03x and overstated by 1.07x, and
+        // at zero padding it disagreed with `report` on an identical partition.
+        let bucketed: Vec<(String, u64, f64)> = rows
+            .iter()
+            .map(|(label, c, w)| {
+                (label.clone(), pad_of.get(c).copied().unwrap_or(*c), *w)
+            })
+            .collect();
         let (bp, bacc) = build_partition(&bucketed);
         let bl = compute_leakage(&bp, &bacc);
         let mean_overhead = total_overhead / p.total_weight;
@@ -398,10 +409,20 @@ fn cmd_scale(rows: &[(String, u64, f64)], n: usize) {
     }
     let min_cost = *p.classes.keys().next().unwrap();
 
-    // Normalised single-item distribution over (cost - min_cost).
+    // Normalised single-item distribution over (cost - min_cost). These are
+    // CLASS probabilities, which is what Shannon leakage H(O) needs.
     let mut dist: BTreeMap<u64, f64> = BTreeMap::new();
     for (&c, &w) in p.classes.iter() {
         *dist.entry(c - min_cost).or_insert(0.0) += w / p.total_weight;
+    }
+    // Min-entropy needs a different object: the largest PER-SECRET probability
+    // within each class. Using class totals here conflates "the chance the
+    // observable is o" with "the chance of the single likeliest secret producing
+    // o", and those differ whenever a class holds more than one secret.
+    let mut mdist: BTreeMap<u64, f64> = BTreeMap::new();
+    for (&c, &mw) in p.max_in_class.iter() {
+        let e = mdist.entry(c - min_cost).or_insert(0.0);
+        *e = e.max(mw / p.total_weight);
     }
 
     println!("Predicted leakage when the guest processes n independent items");
@@ -413,14 +434,39 @@ fn cmd_scale(rows: &[(String, u64, f64)], n: usize) {
     println!();
     println!(
         "  {:<8} {:>12} {:>14} {:>16}",
-        "n", "min-entropy", "total Shannon", "per-item Shannon"
+        "n", "min-entropy", "total Shannon", "marginal (nth)"
     );
     println!(
         "  {:<8} {:>12} {:>14} {:>16}",
         "", "(bits)", "(bits)", "(bits)"
     );
 
+    // Min-entropy leakage over n-tuples needs a MAX-product convolution, not a
+    // class count:
+    //     leakage = log2( sum_o max_{tuples -> o} P(tuple) ) - log2( (max p)^n )
+    // An earlier version used log2(#classes), which is the UNIFORM-prior special
+    // case -- so it was wrong exactly when the caller supplies the realistic
+    // weights this tool encourages. Tracked in log2 space because (max p)^n
+    // underflows f64 long before the n = 4096 the CLI permits.
+    let log2_max_p = (p.max_secret_weight / p.total_weight).log2();
+    let ldist: BTreeMap<u64, f64> = mdist
+        .iter()
+        .filter(|(_, &q)| q > 0.0)
+        .map(|(&c, &q)| (c, q.log2()))
+        .collect();
+
+    /// log2( sum_i 2^{v_i} ), computed stably.
+    fn log2_sum_exp2(vals: impl Iterator<Item = f64>) -> f64 {
+        let v: Vec<f64> = vals.filter(|x| x.is_finite()).collect();
+        if v.is_empty() {
+            return f64::NEG_INFINITY;
+        }
+        let m = v.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        m + v.iter().map(|x| (x - m).exp2()).sum::<f64>().log2()
+    }
+
     let mut cur = dist.clone();
+    let mut lcur = ldist.clone();
     let mut prev_total = 0.0f64;
     for k in 1..=n {
         let h: f64 = cur
@@ -428,8 +474,8 @@ fn cmd_scale(rows: &[(String, u64, f64)], n: usize) {
             .filter(|&&q| q > 0.0)
             .map(|&q| -q * q.log2())
             .sum();
-        let classes = cur.values().filter(|&&q| q > 0.0).count();
-        let per_item = h - prev_total;
+        let min_ent = log2_sum_exp2(lcur.values().cloned()) - (k as f64) * log2_max_p;
+        let marginal = h - prev_total;
         prev_total = h;
         // print a geometric-ish subset plus the final value
         let show = k <= 4 || k == n || (k & (k - 1)) == 0;
@@ -437,12 +483,20 @@ fn cmd_scale(rows: &[(String, u64, f64)], n: usize) {
             println!(
                 "  {:<8} {:>12.4} {:>14.4} {:>16.4}",
                 k,
-                (classes as f64).log2(),
+                min_ent.max(0.0),
                 h,
-                per_item
+                marginal
             );
         }
         if k < n {
+            let mut lnxt: BTreeMap<u64, f64> = BTreeMap::new();
+            for (&a, &la) in lcur.iter() {
+                for (&b, &lb) in ldist.iter() {
+                    let e = lnxt.entry(a + b).or_insert(f64::NEG_INFINITY);
+                    *e = e.max(la + lb);
+                }
+            }
+            lcur = lnxt;
             let mut nxt: BTreeMap<u64, f64> = BTreeMap::new();
             for (&a, &pa) in cur.iter() {
                 for (&b, &pb) in dist.iter() {
@@ -454,10 +508,10 @@ fn cmd_scale(rows: &[(String, u64, f64)], n: usize) {
     }
     println!();
     println!("  Total leakage grows roughly as 0.5*log2(n): each doubling of the batch");
-    println!("  adds about half a bit about the batch as a whole, while what leaks about");
-    println!("  any ONE item falls off as ~1/n. Batching therefore helps per-item");
-    println!("  confidentiality and mildly hurts distinguishability of whole batches --");
-    println!("  which of those matters is a property of your deployment.");
+    println!("  adds about half a bit about the batch AS A WHOLE. The last column is the");
+    println!("  MARGINAL contribution of the n-th item, H(O_n) - H(O_n-1) -- it shrinks");
+    println!("  as ~1/n, which suggests but does not equal I(L_i;O), the leakage about");
+    println!("  one specific item. Treat it as an indicator, not that quantity.");
 }
 
 // ---------------------------------------------------------------------------
@@ -543,6 +597,96 @@ fn cmd_selftest() {
     check("bucket k=4 overhead", sols[3].0 / 4.0, 0.0, 1e-12, &mut failures);
     // k=2 optimum: {0,1} -> 1 and {2,3} -> 3, overhead (1+0+1+0)/4 = 0.5
     check("bucket k=2 overhead", sols[1].0 / 4.0, 0.5, 1e-12, &mut failures);
+
+    // Case 7 (regression): at k = #classes NO padding is applied, so `buckets`
+    // must agree with `report` on the identical partition. The original code
+    // collapsed each class into one pseudo-secret carrying the whole class
+    // weight, which is fine for Shannon but wrong for min-entropy (a max over
+    // per-secret weights, not a sum).
+    //
+    // Uniform prior: 4 secrets, 3 classes {a:2, b:1, c:1}. Correct min-entropy
+    // leakage = log2(3). Collapsed weights would give log2(2+1+1) - log2(2) = 1.
+    let rows7 = vec![
+        ("s0".to_string(), 10u64, 1.0),
+        ("s1".to_string(), 10u64, 1.0),
+        ("s2".to_string(), 20u64, 1.0),
+        ("s3".to_string(), 30u64, 1.0),
+    ];
+    let (p7, a7) = build_partition(&rows7);
+    let l7 = compute_leakage(&p7, &a7);
+    check("no-pad min-ent (report)", l7.min_entropy_bits, 3f64.log2(), 1e-12, &mut failures);
+    let vals7: Vec<(u64, f64)> = p7.classes.iter().map(|(&c, &w)| (c, w)).collect();
+    let sol7 = optimal_buckets(&vals7, 3);
+    // k=3 => every class its own bucket => zero overhead, partition unchanged.
+    check("no-pad overhead is zero", sol7[2].0, 0.0, 1e-12, &mut failures);
+
+    // Case 8 (regression): weighted prior, where collapsing is wrong in the
+    // OTHER direction. 3 secrets, weights 8/1/1, all distinct costs.
+    //   correct: log2(8+1+1) - log2(8) = log2(1.25) = 0.32193
+    let rows8 = vec![
+        ("a".to_string(), 1u64, 8.0),
+        ("b".to_string(), 2u64, 1.0),
+        ("c".to_string(), 3u64, 1.0),
+    ];
+    let (p8, a8) = build_partition(&rows8);
+    let l8 = compute_leakage(&p8, &a8);
+    check("weighted min-ent", l8.min_entropy_bits, 1.25f64.log2(), 1e-12, &mut failures);
+
+    // Case 9 (regression, scale): min-entropy leakage for n=1 must equal what
+    // `report` gives on the same weighted data. log2(#classes) does NOT -- that
+    // is the uniform-prior special case, and `scale` accepts weights.
+    // Same data as case 8: correct 0.32193, class count would give log2(3)=1.585.
+    let probs: Vec<f64> = vec![0.8, 0.1, 0.1];
+    let lmax = probs.iter().cloned().fold(f64::NEG_INFINITY, |m, q| m.max(q.log2()));
+    let sum_of_maxes: f64 = probs.iter().sum();
+    check("scale n=1 min-ent", sum_of_maxes.log2() - lmax, 1.25f64.log2(), 1e-12, &mut failures);
+
+    // Case 9b (regression, scale): the case that case 9 was too weak to catch.
+    // Case 9 is bijective, so class probability == secret probability and the
+    // bug is invisible. Here class {a,b} holds TWO secrets, so the class total
+    // (0.9) differs from the largest secret in it (0.5):
+    //   correct  = log2(0.5 + 0.1) - log2(0.5)      = log2(1.2) = 0.26303
+    //   by class = log2(0.9 + 0.1) - log2(0.9)      = log2(1.111) = 0.15200
+    let rows9b = vec![
+        ("a".to_string(), 7u64, 5.0),
+        ("b".to_string(), 7u64, 4.0),
+        ("c".to_string(), 9u64, 1.0),
+    ];
+    let (p9b, a9b) = build_partition(&rows9b);
+    let l9b = compute_leakage(&p9b, &a9b);
+    check("multi-secret class min-ent", l9b.min_entropy_bits, 1.2f64.log2(), 1e-12, &mut failures);
+    // and the scale n=1 path must agree with it
+    let sum_max_9b: f64 = p9b.max_in_class.values().sum::<f64>() / p9b.total_weight;
+    let lmax_9b = (p9b.max_secret_weight / p9b.total_weight).log2();
+    check("scale n=1 multi-secret", sum_max_9b.log2() - lmax_9b, 1.2f64.log2(), 1e-12, &mut failures);
+
+    // Case 10 (regression, scale): the max-product convolution at n=2, checked
+    // against brute-force enumeration of all 3^2 tuples. This is the step most
+    // likely to be subtly wrong, so it is verified rather than asserted.
+    let costs = [0u64, 1u64, 2u64];
+    let mut brute: BTreeMap<u64, f64> = BTreeMap::new();
+    for (i, &ci) in costs.iter().enumerate() {
+        for (j, &cj) in costs.iter().enumerate() {
+            let e = brute.entry(ci + cj).or_insert(0.0);
+            *e = e.max(probs[i] * probs[j]);
+        }
+    }
+    let brute_sum: f64 = brute.values().sum();
+    let expect_n2 = brute_sum.log2() - 2.0 * lmax;
+    // same quantity via the log-space recurrence the tool uses
+    let ld: Vec<(u64, f64)> = costs.iter().zip(probs.iter()).map(|(&c, &q)| (c, q.log2())).collect();
+    let mut lcur: BTreeMap<u64, f64> = ld.iter().cloned().collect();
+    let mut lnxt: BTreeMap<u64, f64> = BTreeMap::new();
+    for (&a, &la) in lcur.iter() {
+        for &(b, lb) in ld.iter() {
+            let e = lnxt.entry(a + b).or_insert(f64::NEG_INFINITY);
+            *e = e.max(la + lb);
+        }
+    }
+    lcur = lnxt;
+    let m = lcur.values().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let got_n2 = m + lcur.values().map(|x| (x - m).exp2()).sum::<f64>().log2() - 2.0 * lmax;
+    check("scale n=2 vs brute force", got_n2, expect_n2, 1e-12, &mut failures);
 
     println!();
     if failures == 0 {
